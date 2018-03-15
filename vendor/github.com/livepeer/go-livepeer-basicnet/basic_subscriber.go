@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"time"
 
+	inet "gx/ipfs/QmNa31VPzC561NWwRsJLE7nGYZYuuD2QfpK2b1q9BK54J1/go-libp2p-net"
 	kb "gx/ipfs/QmSAFA8v42u4gpJNy1tb7vW3JiiXiaYDC2b845c2RnNSJL/go-libp2p-kbucket"
+	ma "gx/ipfs/QmXY77cVe7rVRQXZZQRioukUM7aRW3BTcAgJe12MCtb3Ji/go-multiaddr"
 	peer "gx/ipfs/QmXYjuNuxVzXKJCfWasQk1RqkhVLDM9jtUKhqc2WPQmFSB/go-libp2p-peer"
 
 	"github.com/golang/glog"
@@ -46,6 +48,28 @@ func (s *BasicSubscriber) InsertData(sd *StreamDataMsg) error {
 
 //Subscribe kicks off a go routine that calls the gotData func for every new video chunk
 func (s *BasicSubscriber) Subscribe(ctx context.Context, gotData func(seqNo uint64, data []byte, eof bool)) error {
+	glog.Infof("Sending SubReq message")
+	return s.sendSub(ctx, SubReqID, SubReqMsg{StrmID: s.StrmID}, gotData)
+}
+
+func (s *BasicSubscriber) TranscoderSubscribe(ctx context.Context, gotData func(seqNo uint64, data []byte, eof bool)) error {
+	ts := TranscodeSubMsg{
+		MultiAddrs: s.Network.NetworkNode.Host().Addrs(),
+		NodeID:     s.Network.NetworkNode.ID(),
+		StrmID:     s.StrmID,
+	}
+	sig, err := s.Network.NetworkNode.Sign(ts.BytesForSigning())
+	if err != nil {
+		glog.Errorf("Error signing TranscodeSubMsg: %v", err)
+		return err
+	}
+	ts.Sig = sig
+	s.Network.NetworkNode.Host().Network().Notify(s)
+	glog.Infof("Sending TranscodeSub message")
+	return s.sendSub(ctx, TranscodeSubID, ts, gotData)
+}
+
+func (s *BasicSubscriber) sendSub(ctx context.Context, opCode Opcode, msg interface{}, gotData func(seqNo uint64, data []byte, eof bool)) error {
 	//Do we already have the broadcaster locally? If we do, just subscribe to it and listen.
 	if b := s.Network.broadcasters[s.StrmID]; b != nil {
 		localS := NewLocalOutStream(s)
@@ -79,10 +103,10 @@ func (s *BasicSubscriber) Subscribe(ctx context.Context, gotData func(seqNo uint
 		glog.V(5).Infof("New peer from kademlia: %v", peer.IDHexEncode(p))
 		ns := s.Network.NetworkNode.GetOutStream(p)
 		if ns != nil {
-			//Send SubReq
-			glog.Infof("Sending Req %v", s.StrmID)
-			if err := ns.SendMessage(SubReqID, SubReqMsg{StrmID: s.StrmID}); err != nil {
-				glog.Errorf("Error sending SubReq to %v: %v", peer.IDHexEncode(p), err)
+			err = s.Network.sendMessageWithRetry(p, ns, opCode, msg)
+			if err != nil {
+				glog.Errorf("Error sending message %v to %v", opCode, p)
+				return err
 			}
 			ctxW, cancel := context.WithCancel(context.Background())
 			s.cancelWorker = cancel
@@ -120,7 +144,7 @@ func (s *BasicSubscriber) startWorker(ctxW context.Context, ws *BasicOutStream, 
 				//Send EOF
 				go gotData(0, nil, true)
 				if ws != nil {
-					if err := ws.SendMessage(CancelSubID, CancelSubMsg{StrmID: s.StrmID}); err != nil {
+					if err := s.Network.sendMessageWithRetry(ws.Stream.Conn().RemotePeer(), ws, CancelSubID, CancelSubMsg{StrmID: s.StrmID}); err != nil {
 						glog.Errorf("Error sending CancelSubMsg during worker cancellation: %v", err)
 					}
 				}
@@ -143,6 +167,7 @@ func (s *BasicSubscriber) Unsubscribe() error {
 
 	//Remove self from network
 	delete(s.Network.subscribers, s.StrmID)
+	s.Network.NetworkNode.Host().Network().StopNotify(s)
 
 	return nil
 }
@@ -153,4 +178,49 @@ func (s BasicSubscriber) String() string {
 
 func (s *BasicSubscriber) IsLive() bool {
 	return s.working
+}
+
+// Notifiee
+func (s *BasicSubscriber) HandleConnection(conn inet.Conn) {
+}
+func (s *BasicSubscriber) Listen(n inet.Network, m ma.Multiaddr) {
+}
+func (s *BasicSubscriber) ListenClose(n inet.Network, m ma.Multiaddr) {
+}
+func (s *BasicSubscriber) OpenedStream(n inet.Network, st inet.Stream) {
+}
+func (s *BasicSubscriber) ClosedStream(n inet.Network, st inet.Stream) {
+}
+func (s *BasicSubscriber) Connected(n inet.Network, conn inet.Conn) {
+	glog.Infof("%v Connected; processing", conn.LocalPeer())
+	broadcasterPid, err := extractNodeID(s.StrmID)
+	if err != nil {
+		glog.Errorf("%v Unable to extract NodeID from %v", conn.LocalPeer(), s.StrmID)
+		return
+	}
+	if conn.RemotePeer() != broadcasterPid {
+		glog.Infof("%v subscriber got a connection from a non-sub %v", conn.LocalPeer(), conn.RemotePeer())
+		return
+	}
+	// check for duplicated cxns or subs?
+	glog.Infof("%v Getting OutStream", conn.LocalPeer())
+	go func() {
+		ns := s.Network.NetworkNode.GetOutStream(conn.RemotePeer())
+		if ns == nil {
+			glog.Errorf("%v Unable to create an outstream with %v", conn.LocalPeer(), conn.RemotePeer())
+			return
+		}
+		glog.Infof("%v Sending Message: SubReq", conn.LocalPeer())
+		err = s.Network.sendMessageWithRetry(conn.RemotePeer(), ns, SubReqID, SubReqMsg{StrmID: s.StrmID})
+		if err != nil {
+			glog.Errorf("%v Unable to send SubReq to %v : %v", conn.LocalPeer(), conn.RemotePeer(), err)
+			return
+		}
+		glog.Infof("%v Setting Upstream Peer", conn.LocalPeer())
+		s.UpstreamPeer = conn.RemotePeer()
+		glog.Infof("%v Subscriber got direct connection from %v", conn.LocalPeer(), conn.RemotePeer())
+	}()
+}
+func (s *BasicSubscriber) Disconnected(n inet.Network, conn inet.Conn) {
+	// Resend TranscodeSub periodically if necessary?
 }
